@@ -11,9 +11,20 @@ from classifier import (
     read_csv,
 )
 from master import (
+    PROTECTED_CATEGORIES,
+    add_category,
+    add_eye_sub,
+    category_in_use,
     delete_asin,
+    delete_category,
+    delete_eye_sub,
+    eye_sub_in_use,
     load_master,
     master_path,
+    rename_category,
+    rename_eye_sub,
+    reorder_category,
+    reorder_eye_sub,
     save_master,
     upsert_asin,
 )
@@ -42,7 +53,8 @@ class App:
         top.pack(fill="x")
 
         ttk.Button(top, text="📂 CSV 열기", command=self.open_csv).pack(side="left")
-        ttk.Button(top, text="⚙ 마스터 편집", command=self.open_master_editor).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="⚙ ASIN 편집", command=self.open_master_editor).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="📁 카테고리 관리", command=self.open_category_editor).pack(side="left", padx=(8, 0))
         self.file_label = ttk.Label(top, text="파일 없음", foreground="#666")
         self.file_label.pack(side="left", padx=(12, 0))
 
@@ -263,6 +275,9 @@ class App:
     def open_master_editor(self):
         MasterEditor(self.root, self.master, on_save=self._on_master_saved)
 
+    def open_category_editor(self):
+        CategoryEditor(self.root, self.master, on_save=self._on_master_saved)
+
     def _on_master_saved(self):
         save_master(self.master)
         if self.report is not None and self.current_csv is not None:
@@ -391,6 +406,212 @@ class MasterEditor:
 
     def close(self):
         self.dlg.destroy()
+
+
+class CategoryEditor:
+    def __init__(self, parent: tk.Tk, master: dict, on_save):
+        self.master = master
+        self.on_save = on_save
+        self.dlg = tk.Toplevel(parent)
+        self.dlg.title("카테고리 관리")
+        self.dlg.geometry("520x520")
+        self.dlg.transient(parent)
+        self.dlg.grab_set()
+
+        notebook = ttk.Notebook(self.dlg)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self._build_tab(
+            notebook, "전체 카테고리", "categories",
+            list_kind="category",
+        )
+        self._build_tab(
+            notebook, "아이패치 세부분류", "eye_subcategories",
+            list_kind="eye_sub",
+        )
+
+        bottom = ttk.Frame(self.dlg, padding=(10, 0, 10, 10))
+        bottom.pack(fill="x")
+        ttk.Label(
+            bottom,
+            text="🛡 \"기타\", \"아이세럼패치\"는 시스템 보호 — 삭제/이름변경 불가",
+            foreground="#888", font=("", 9),
+        ).pack(side="left")
+        ttk.Button(bottom, text="닫기", command=self.dlg.destroy).pack(side="right")
+
+    def _build_tab(self, notebook: ttk.Notebook, label: str, key: str, list_kind: str):
+        frame = ttk.Frame(notebook, padding=10)
+        notebook.add(frame, text=label)
+
+        listbox = tk.Listbox(frame, height=12, exportselection=False)
+        listbox.pack(side="left", fill="both", expand=True)
+        for name in self.master[key]:
+            listbox.insert("end", name)
+
+        usage_label = ttk.Label(frame, text="", foreground="#666", padding=(8, 0))
+
+        btn_col = ttk.Frame(frame, padding=(8, 0))
+        btn_col.pack(side="left", fill="y")
+
+        def selected_idx() -> int | None:
+            sel = listbox.curselection()
+            return sel[0] if sel else None
+
+        def update_status(*_):
+            idx = selected_idx()
+            if idx is None:
+                usage_label.config(text="")
+                return
+            name = self.master[key][idx]
+            if list_kind == "category":
+                cnt = category_in_use(self.master, name)
+            else:
+                cnt = eye_sub_in_use(self.master, name)
+            protected = list_kind == "category" and name in PROTECTED_CATEGORIES
+            tag = " (보호됨)" if protected else ""
+            usage_label.config(text=f"\"{name}\" 사용 중인 ASIN: {cnt}개{tag}")
+
+        listbox.bind("<<ListboxSelect>>", update_status)
+
+        def refresh():
+            sel = selected_idx()
+            listbox.delete(0, "end")
+            for name in self.master[key]:
+                listbox.insert("end", name)
+            if sel is not None and sel < listbox.size():
+                listbox.selection_set(sel)
+            update_status()
+            self.on_save()
+
+        def do_up():
+            idx = selected_idx()
+            if idx is None:
+                return
+            mover = reorder_category if list_kind == "category" else reorder_eye_sub
+            new_idx = mover(self.master, idx, -1)
+            if new_idx is not None:
+                listbox.delete(0, "end")
+                for name in self.master[key]:
+                    listbox.insert("end", name)
+                listbox.selection_set(new_idx)
+                self.on_save()
+                update_status()
+
+        def do_down():
+            idx = selected_idx()
+            if idx is None:
+                return
+            mover = reorder_category if list_kind == "category" else reorder_eye_sub
+            new_idx = mover(self.master, idx, +1)
+            if new_idx is not None:
+                listbox.delete(0, "end")
+                for name in self.master[key]:
+                    listbox.insert("end", name)
+                listbox.selection_set(new_idx)
+                self.on_save()
+                update_status()
+
+        def do_add():
+            name = self._prompt_name("새 항목 추가", "이름:", "")
+            if not name:
+                return
+            try:
+                if list_kind == "category":
+                    add_category(self.master, name)
+                else:
+                    add_eye_sub(self.master, name)
+            except ValueError as e:
+                messagebox.showerror("추가 실패", str(e), parent=self.dlg)
+                return
+            refresh()
+
+        def do_rename():
+            idx = selected_idx()
+            if idx is None:
+                return
+            old = self.master[key][idx]
+            if list_kind == "category" and old in PROTECTED_CATEGORIES:
+                messagebox.showinfo("불가", f"\"{old}\"는 보호된 카테고리입니다.", parent=self.dlg)
+                return
+            new = self._prompt_name("이름 변경", f"\"{old}\"의 새 이름:", old)
+            if not new or new == old:
+                return
+            try:
+                if list_kind == "category":
+                    rename_category(self.master, old, new)
+                else:
+                    rename_eye_sub(self.master, old, new)
+            except ValueError as e:
+                messagebox.showerror("이름변경 실패", str(e), parent=self.dlg)
+                return
+            refresh()
+
+        def do_delete():
+            idx = selected_idx()
+            if idx is None:
+                return
+            name = self.master[key][idx]
+            if list_kind == "category" and name in PROTECTED_CATEGORIES:
+                messagebox.showinfo("불가", f"\"{name}\"는 보호된 카테고리입니다.", parent=self.dlg)
+                return
+            if list_kind == "category":
+                cnt = category_in_use(self.master, name)
+            else:
+                cnt = eye_sub_in_use(self.master, name)
+            if cnt > 0:
+                messagebox.showwarning(
+                    "삭제 불가",
+                    f"\"{name}\"에 {cnt}개의 ASIN이 있습니다.\n\n"
+                    f"먼저 'ASIN 편집'에서 이 ASIN들을 다른 카테고리로 옮긴 후 삭제하세요.",
+                    parent=self.dlg,
+                )
+                return
+            if not messagebox.askyesno("삭제 확인", f"\"{name}\"를 삭제하시겠습니까?", parent=self.dlg):
+                return
+            try:
+                if list_kind == "category":
+                    delete_category(self.master, name)
+                else:
+                    delete_eye_sub(self.master, name)
+            except ValueError as e:
+                messagebox.showerror("삭제 실패", str(e), parent=self.dlg)
+                return
+            refresh()
+
+        ttk.Button(btn_col, text="▲", width=4, command=do_up).pack(pady=(0, 4))
+        ttk.Button(btn_col, text="▼", width=4, command=do_down).pack(pady=(0, 12))
+        ttk.Button(btn_col, text="추가", width=8, command=do_add).pack(pady=(0, 4))
+        ttk.Button(btn_col, text="이름변경", width=8, command=do_rename).pack(pady=(0, 4))
+        ttk.Button(btn_col, text="삭제", width=8, command=do_delete).pack()
+
+        usage_label.pack(side="bottom", fill="x", pady=(8, 0))
+
+    def _prompt_name(self, title: str, prompt: str, initial: str) -> str | None:
+        d = tk.Toplevel(self.dlg)
+        d.title(title)
+        d.geometry("320x140")
+        d.transient(self.dlg)
+        d.grab_set()
+        ttk.Label(d, text=prompt, padding=(12, 12, 12, 4)).pack(anchor="w")
+        var = tk.StringVar(value=initial)
+        entry = ttk.Entry(d, textvariable=var)
+        entry.pack(fill="x", padx=12)
+        entry.focus_set()
+        entry.select_range(0, "end")
+        result = {"value": None}
+        def ok():
+            result["value"] = var.get().strip()
+            d.destroy()
+        def cancel():
+            d.destroy()
+        btns = ttk.Frame(d, padding=12)
+        btns.pack(fill="x", side="bottom")
+        ttk.Button(btns, text="확인", command=ok).pack(side="right")
+        ttk.Button(btns, text="취소", command=cancel).pack(side="right", padx=(0, 6))
+        entry.bind("<Return>", lambda e: ok())
+        entry.bind("<Escape>", lambda e: cancel())
+        d.wait_window()
+        return result["value"] or None
 
 
 def main():
